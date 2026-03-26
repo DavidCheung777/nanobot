@@ -230,7 +230,6 @@ class OpenAICompatProvider(LLMProvider):
             "model": model_name,
             "messages": self._sanitize_messages(self._sanitize_empty_content(messages)),
             "max_tokens": max(1, max_tokens),
-            "max_completion_tokens": max(1, max_tokens),
             "temperature": temperature,
         }
 
@@ -240,6 +239,8 @@ class OpenAICompatProvider(LLMProvider):
                 if pattern in model_lower:
                     kwargs.update(overrides)
                     break
+        if "max_completion_tokens" in kwargs and "max_tokens" in kwargs:
+            kwargs.pop("max_tokens", None)
 
         if reasoning_effort:
             kwargs["reasoning_effort"] = reasoning_effort
