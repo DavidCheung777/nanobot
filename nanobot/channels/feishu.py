@@ -5,9 +5,11 @@ import json
 import os
 import re
 import threading
+import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import parse_qs, urlparse
 
 from loguru import logger
 
@@ -29,6 +31,57 @@ MSG_TYPE_MAP = {
     "file": "[file]",
     "sticker": "[sticker]",
 }
+
+_AUTH_URL_RE = re.compile(
+    r"https?://(?:open\.feishu\.cn/open-apis/authen/v1/index|accounts\.feishu\.cn/oauth/v1/device_authorization|accounts\.larksuite\.com/oauth/v1/device_authorization)[^\s>]*",
+    re.IGNORECASE,
+)
+
+
+def _maybe_extract_auth_url(text: str) -> str | None:
+    if not text:
+        return None
+    m = _AUTH_URL_RE.search(text)
+    return m.group(0) if m else None
+
+
+def _build_auth_card_from_url(url: str) -> dict:
+    scopes: list[str] = []
+    try:
+        parsed = urlparse(url)
+        qs = parse_qs(parsed.query)
+        scope_raw = ""
+        if "scope" in qs and qs["scope"]:
+            scope_raw = qs["scope"][0]
+        if scope_raw:
+            scopes = [s.strip() for s in re.split(r"[,\s]+", scope_raw) if s.strip()]
+    except Exception:
+        scopes = []
+
+    scope_lines = "\n".join([f"- {s}" for s in scopes]) if scopes else "- (未解析到 scope)"
+    content = f"需要完成授权后才能继续。\n\n所需权限：\n{scope_lines}"
+
+    multi_url = {"url": url, "pc_url": url, "android_url": url, "ios_url": url}
+    return {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": False},
+        "header": {
+            "title": {"tag": "plain_text", "content": "需要授权"},
+            "template": "blue",
+            "icon": {"tag": "standard_icon", "token": "lock-chat_filled"},
+        },
+        "body": {
+            "elements": [
+                {"tag": "markdown", "content": content},
+                {
+                    "tag": "action",
+                    "actions": [
+                        {"tag": "button", "text": {"tag": "plain_text", "content": "去授权"}, "type": "primary", "multi_url": multi_url}
+                    ],
+                },
+            ]
+        },
+    }
 
 
 def _extract_share_card_content(content_json: dict, msg_type: str) -> str:
@@ -279,6 +332,7 @@ class FeishuChannel(BaseChannel):
         self._ws_thread: threading.Thread | None = None
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread_bootstrapped: set[str] = set()
 
     @staticmethod
     def _register_optional_event(builder: Any, method_name: str, handler: Any) -> Any:
@@ -881,18 +935,197 @@ class FeishuChannel(BaseChannel):
             logger.debug("Feishu: error fetching parent message {}: {}", message_id, e)
             return None
 
-    def _reply_message_sync(self, parent_message_id: str, msg_type: str, content: str) -> bool:
-        """Reply to an existing Feishu message using the Reply API (synchronous)."""
-        from lark_oapi.api.im.v1 import ReplyMessageRequest, ReplyMessageRequestBody
+    def _build_thread_session_key(self, chat_id: str, root_id: str | None, thread_id: str | None, message_id: str) -> str | None:
+        topic = (root_id or "").strip() or (thread_id or "").strip() or (message_id or "").strip()
+        if not topic:
+            return None
+        return f"{self.name}:{chat_id}:thread:{topic}"
+
+    def _get_message_plain_text_sync(self, message_id: str) -> str | None:
+        from lark_oapi.api.im.v1 import GetMessageRequest
         try:
-            request = ReplyMessageRequest.builder() \
-                .message_id(parent_message_id) \
-                .request_body(
-                    ReplyMessageRequestBody.builder()
-                    .msg_type(msg_type)
-                    .content(content)
-                    .build()
-                ).build()
+            request = GetMessageRequest.builder().message_id(message_id).build()
+            response = self._client.im.v1.message.get(request)
+            if not response.success():
+                return None
+            items = getattr(response.data, "items", None)
+            if not items:
+                return None
+            msg_obj = items[0]
+            raw_content = getattr(getattr(msg_obj, "body", None), "content", None)
+            if not raw_content:
+                return None
+            try:
+                content_json = json.loads(raw_content)
+            except (json.JSONDecodeError, TypeError):
+                return None
+            msg_type = getattr(msg_obj, "msg_type", "")
+            if msg_type == "text":
+                return (content_json.get("text", "") or "").strip() or None
+            if msg_type == "post":
+                text, _ = _extract_post_content(content_json)
+                return text.strip() or None
+            if msg_type == "interactive":
+                text = _extract_share_card_content(content_json, "interactive")
+                return text.strip() or None
+            return None
+        except Exception:
+            return None
+
+    def _resolve_thread_id_sync(self, root_id: str | None, thread_id: str | None) -> str | None:
+        tid = (thread_id or "").strip()
+        if tid:
+            return tid
+        rid = (root_id or "").strip()
+        if not rid:
+            return None
+        from lark_oapi.api.im.v1 import GetMessageRequest
+        try:
+            request = GetMessageRequest.builder().message_id(rid).build()
+            response = self._client.im.v1.message.get(request)
+            if not response.success():
+                return None
+            items = getattr(response.data, "items", None)
+            if not items:
+                return None
+            msg_obj = items[0]
+            resolved = getattr(msg_obj, "thread_id", None)
+            return str(resolved).strip() if resolved else None
+        except Exception:
+            return None
+
+    def _list_thread_messages_sync(self, thread_id: str, limit: int = 20) -> list[dict]:
+        try:
+            import lark_oapi as lark
+
+            req = (
+                lark.BaseRequest.builder()
+                .http_method(lark.HttpMethod.GET)
+                .uri("/open-apis/im/v1/messages")
+                .token_types({lark.AccessTokenType.TENANT})
+                .queries(
+                    [
+                        ("container_id_type", "thread"),
+                        ("container_id", thread_id),
+                        ("sort_type", "ByCreateTimeDesc"),
+                        ("page_size", str(min(limit + 1, 50))),
+                    ]
+                )
+                .build()
+            )
+            resp = self._client.request(req)
+            if not resp.success():
+                return []
+            raw = getattr(getattr(resp, "raw", None), "content", None)
+            if not raw:
+                return []
+            payload = json.loads(raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw)
+            data = payload.get("data") if isinstance(payload, dict) else None
+            items = data.get("items") if isinstance(data, dict) else None
+            return items if isinstance(items, list) else []
+        except Exception:
+            return []
+
+    def _build_thread_bootstrap_sync(
+        self,
+        *,
+        chat_id: str,
+        current_message_id: str,
+        root_id: str | None,
+        thread_id: str | None,
+        limit: int = 20,
+    ) -> str:
+        resolved_thread_id = self._resolve_thread_id_sync(root_id, thread_id)
+        if not resolved_thread_id:
+            return ""
+
+        starter = self._get_message_plain_text_sync((root_id or "").strip()) if root_id else None
+        items = self._list_thread_messages_sync(resolved_thread_id, limit=limit)
+        rows: list[str] = []
+        for item in items:
+            mid = str(item.get("message_id") or "")
+            if mid and mid == current_message_id:
+                continue
+            if root_id and mid and mid == root_id:
+                continue
+            msg_type = str(item.get("msg_type") or "")
+            raw_content = ((item.get("body") or {}) if isinstance(item.get("body"), dict) else {}).get("content") or ""
+            text = ""
+            try:
+                content_json = json.loads(raw_content) if raw_content else {}
+            except Exception:
+                content_json = {}
+            if msg_type == "text":
+                text = str(content_json.get("text") or "").strip()
+            elif msg_type == "post":
+                t, _ = _extract_post_content(content_json)
+                text = t.strip()
+            elif msg_type == "interactive":
+                text = _extract_share_card_content(content_json, "interactive").strip()
+            if not text:
+                text = f"[{msg_type or 'message'}]"
+            sender = item.get("sender") if isinstance(item.get("sender"), dict) else {}
+            sender_type = str(sender.get("sender_type") or "")
+            sender_id = str(sender.get("id") or "")
+            role = "assistant" if sender_type == "app" else "user"
+            rows.append(f"{sender_id or role} ({role}): {text}")
+            if len(rows) >= limit:
+                break
+        rows.reverse()
+
+        parts: list[str] = []
+        if starter:
+            parts.append(f'[Thread starter]\n{starter}')
+        if rows:
+            parts.append("[Thread history]\n" + "\n".join(rows))
+        return "\n\n".join(parts)
+
+    def _reply_message_sync(
+        self,
+        parent_message_id: str,
+        msg_type: str,
+        content: str,
+        reply_in_thread: bool = False,
+    ) -> bool:
+        """Reply to an existing Feishu message using the Reply API (synchronous)."""
+        try:
+            from lark_oapi.api.im.v1 import ReplyMessageRequest, ReplyMessageRequestBody
+
+            body_builder = ReplyMessageRequestBody.builder().msg_type(msg_type).content(content)
+            if reply_in_thread:
+                setter = getattr(body_builder, "reply_in_thread", None)
+                if callable(setter):
+                    body_builder = setter(True)
+                else:
+                    import lark_oapi as lark
+
+                    req = (
+                        lark.BaseRequest.builder()
+                        .http_method(lark.HttpMethod.POST)
+                        .uri(f"/open-apis/im/v1/messages/{parent_message_id}/reply")
+                        .token_types({lark.AccessTokenType.TENANT})
+                        .body({"content": content, "msg_type": msg_type, "reply_in_thread": True})
+                        .build()
+                    )
+                    response = self._client.request(req)
+                    if not response.success():
+                        logger.error(
+                            "Failed to reply to Feishu message {}: code={}, msg={}, log_id={}",
+                            parent_message_id,
+                            response.code,
+                            response.msg,
+                            response.get_log_id(),
+                        )
+                        return False
+                    logger.debug("Feishu reply sent to message {}", parent_message_id)
+                    return True
+
+            request = (
+                ReplyMessageRequest.builder()
+                .message_id(parent_message_id)
+                .request_body(body_builder.build())
+                .build()
+            )
             response = self._client.im.v1.message.reply(request)
             if not response.success():
                 logger.error(
@@ -955,14 +1188,11 @@ class FeishuChannel(BaseChannel):
             # Only the very first send (media or text) in this call uses reply; subsequent
             # chunks/media fall back to plain create to avoid redundant quote bubbles.
             reply_message_id: str | None = None
-            if (
-                self.config.reply_to_message
-                and not msg.metadata.get("_progress", False)
-            ):
-                reply_message_id = msg.metadata.get("message_id") or None
-            # For topic group messages, always reply to keep context in thread
-            elif msg.metadata.get("thread_id"):
+            reply_in_thread = bool(msg.metadata.get("thread_id"))
+            if reply_in_thread:
                 reply_message_id = msg.metadata.get("root_id") or msg.metadata.get("message_id") or None
+            elif self.config.reply_to_message and not msg.metadata.get("_progress", False):
+                reply_message_id = msg.metadata.get("message_id") or None
 
             first_send = True  # tracks whether the reply has already been used
 
@@ -971,9 +1201,11 @@ class FeishuChannel(BaseChannel):
                 nonlocal first_send
                 if reply_message_id and first_send:
                     first_send = False
-                    ok = self._reply_message_sync(reply_message_id, m_type, content)
+                    ok = self._reply_message_sync(reply_message_id, m_type, content, reply_in_thread=reply_in_thread)
                     if ok:
                         return
+                    if reply_in_thread:
+                        raise RuntimeError("Feishu thread reply failed")
                     # Fall back to regular send if reply fails
                 self._send_message_sync(receive_id_type, msg.chat_id, m_type, content)
 
@@ -1007,6 +1239,14 @@ class FeishuChannel(BaseChannel):
                         )
 
             if msg.content and msg.content.strip():
+                auth_url = _maybe_extract_auth_url(msg.content.strip())
+                if auth_url:
+                    card = _build_auth_card_from_url(auth_url)
+                    await loop.run_in_executor(
+                        None, _do_send, "interactive", json.dumps(card, ensure_ascii=False)
+                    )
+                    return
+
                 fmt = self._detect_msg_format(msg.content)
 
                 if fmt == "text":
@@ -1126,15 +1366,32 @@ class FeishuChannel(BaseChannel):
             parent_id = getattr(message, "parent_id", None) or None
             root_id = getattr(message, "root_id", None) or None
             thread_id = getattr(message, "thread_id", None) or None
+            loop = asyncio.get_running_loop()
+            thread_session_key: str | None = None
+            if chat_type == "group" and (root_id or thread_id):
+                thread_session_key = self._build_thread_session_key(chat_id, root_id, thread_id, message_id)
 
             # Prepend quoted message text when the user replied to another message
             if parent_id and self._client:
-                loop = asyncio.get_running_loop()
                 reply_ctx = await loop.run_in_executor(
                     None, self._get_message_content_sync, parent_id
                 )
                 if reply_ctx:
                     content_parts.insert(0, reply_ctx)
+
+            if thread_session_key and thread_session_key not in self._thread_bootstrapped:
+                bootstrap = await loop.run_in_executor(
+                    None,
+                    lambda: self._build_thread_bootstrap_sync(
+                        chat_id=chat_id,
+                        current_message_id=message_id,
+                        root_id=root_id,
+                        thread_id=thread_id,
+                    ),
+                )
+                if bootstrap:
+                    content_parts.insert(0, bootstrap)
+                self._thread_bootstrapped.add(thread_session_key)
 
             content = "\n".join(content_parts) if content_parts else ""
 
@@ -1155,7 +1412,8 @@ class FeishuChannel(BaseChannel):
                     "parent_id": parent_id,
                     "root_id": root_id,
                     "thread_id": thread_id,
-                }
+                },
+                session_key=thread_session_key,
             )
 
         except Exception as e:
